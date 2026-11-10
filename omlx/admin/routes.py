@@ -1011,6 +1011,29 @@ def _dflash_compat_for_model(model_info: dict) -> tuple[bool, str]:
     return dflash_compatibility(model_type, model_info.get("engine_type"))
 
 
+# External engines run their own speculation (Splash uses DFlash2 drafts)
+# and ignore oMLX's MTP heads entirely, so the MTP toggle must not be
+# offered while one serves the model.
+EXTERNAL_ENGINE_MTP_REASON = "MTP is not used when an external engine serves this model"
+
+
+def _demote_mtp_for_selected_engine(
+    mtp_ok: bool,
+    mtp_reason: str,
+    settings,
+    external_engines: list[dict],
+) -> tuple[bool, str]:
+    """Report MTP unavailable when the selected external engine can serve."""
+    if not mtp_ok or settings is None or not settings.external_engine:
+        return mtp_ok, mtp_reason
+    if any(
+        engine["id"] == settings.external_engine and engine["compatible"]
+        for engine in external_engines
+    ):
+        return False, EXTERNAL_ENGINE_MTP_REASON
+    return mtp_ok, mtp_reason
+
+
 def _external_engines_for_model(engine_pool, model_info: dict, settings) -> list[dict]:
     """Each external engine and whether it can serve this model."""
     if model_info.get("engine_type") not in ("batched", "vlm"):
@@ -2457,6 +2480,9 @@ async def list_models(is_admin: bool = Depends(require_admin)):
         external_engines = _external_engines_for_model(
             engine_pool, model_info, settings
         )
+        mtp_compat_ok, mtp_compat_reason = _demote_mtp_for_selected_engine(
+            mtp_compat_ok, mtp_compat_reason, settings, external_engines
+        )
         from ..patches.moe_offload_compat import moe_offload_compatibility
 
         moe_offload_supported, _ = moe_offload_compatibility(
@@ -3396,6 +3422,16 @@ async def update_model_settings(
             )
             if not compat_ok:
                 raise HTTPException(status_code=400, detail=compat_reason)
+            # The engine selection was already applied above; a serving
+            # external engine would ignore mtp_enabled silently.
+            if current_settings.external_engine:
+                target, _ = await asyncio.to_thread(
+                    engine_pool.splash_target, model_id, current_settings
+                )
+                if target is not None:
+                    raise HTTPException(
+                        status_code=400, detail=EXTERNAL_ENGINE_MTP_REASON
+                    )
             # Mutual exclusion with DFlash — ModelSettings.__post_init__
             # also enforces this, but we surface a clearer error here.
             dflash_after = (
